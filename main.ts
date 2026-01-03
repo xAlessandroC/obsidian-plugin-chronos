@@ -16,7 +16,14 @@ import { ChronosPluginSettings } from "./types";
 import { TextModal } from "./components/TextModal";
 import { FolderListModal } from "./components/FolderListModal";
 import { knownLocales } from "./util/knownLocales";
-import { DEFAULT_LOCALE, PEPPER, PROVIDER_DEFAULT_MODELS, DETECTION_PATTERN_TEXT, DETECTION_PATTERN_HTML } from "./constants";
+import {
+	DEFAULT_LOCALE,
+	PEPPER,
+	PROVIDER_DEFAULT_MODELS,
+	DETECTION_PATTERN_TEXT,
+	DETECTION_PATTERN_HTML,
+	DETECTION_PATTERN_CODEBLOCK,
+} from "./constants";
 
 // HACKY IMPORT TO ACCOMODATE SYMLINKS IN LOCAL DEV
 import * as ChronosLib from "chronos-timeline-md";
@@ -42,6 +49,8 @@ const DEFAULT_SETTINGS: ChronosPluginSettings = {
 export default class ChronosPlugin extends Plugin {
 	settings: ChronosPluginSettings;
 	private observedEditors = new Set<HTMLElement>();
+	private folderChronosCache = new Map<string, boolean>();
+	private cacheInitialized = false;
 
 	async onload() {
 		console.log("Loading Chronos Timeline Plugin....");
@@ -68,9 +77,37 @@ export default class ChronosPlugin extends Plugin {
 
 		this.addSettingTab(new ChronosPluginSettingTab(this.app, this));
 
+		// Initialize folder cache in background to track which folders contain chronos blocks
+		this._initializeFolderCache();
+
 		this.registerEvent(
 			this.app.vault.on("rename", async (file, oldPath) => {
 				await this._updateWikiLinks(oldPath, file.path);
+			}),
+		);
+
+		// Invalidate cache when files are modified, created, or deleted
+		this.registerEvent(
+			this.app.vault.on("modify", (file) => {
+				if (file instanceof TFile && file.extension === "md") {
+					this._invalidateFolderCache(file.parent);
+				}
+			}),
+		);
+
+		this.registerEvent(
+			this.app.vault.on("create", (file) => {
+				if (file instanceof TFile && file.extension === "md") {
+					this._invalidateFolderCache(file.parent);
+				}
+			}),
+		);
+
+		this.registerEvent(
+			this.app.vault.on("delete", (file) => {
+				if (file instanceof TFile && file.extension === "md") {
+					this._invalidateFolderCache(file.parent);
+				}
 			}),
 		);
 
@@ -80,25 +117,34 @@ export default class ChronosPlugin extends Plugin {
 		);
 
 		this.registerMarkdownPostProcessor((element, context) => {
-			const inlineCodes = element.querySelectorAll('code');
+			const inlineCodes = element.querySelectorAll("code");
 
-            inlineCodes.forEach((codeEl) => {
-                if (codeEl.closest('pre')) return; // Skip fenced code blocks
+			inlineCodes.forEach((codeEl) => {
+				if (codeEl.closest("pre")) return; // Skip fenced code blocks
 
 				let match;
-                if ((match = DETECTION_PATTERN_HTML.exec(codeEl.textContent ?? "")) !== null) {
-                    const date_match = /\[.*?\]/.exec(match[1]);
-					codeEl.textContent = (date_match == null) ? "Chronos Error format..." : new Date(date_match[0].slice(1,-1))
-																							.toLocaleDateString(
-																								this.settings.selectedLocale,
-																							{
-																								month: "short",
-																								day: "2-digit",
-																								year: "2-digit",
-																							});
-                }
-            });
-        });
+				if (
+					(match = DETECTION_PATTERN_HTML.exec(
+						codeEl.textContent ?? "",
+					)) !== null
+				) {
+					const date_match = /\[.*?\]/.exec(match[1]);
+					codeEl.textContent =
+						date_match == null
+							? "Chronos Error format..."
+							: new Date(
+									date_match[0].slice(1, -1),
+								).toLocaleDateString(
+									this.settings.selectedLocale,
+									{
+										month: "short",
+										day: "2-digit",
+										year: "2-digit",
+									},
+								);
+				}
+			});
+		});
 
 		this.addCommand({
 			id: "insert-timeline-blank",
@@ -360,8 +406,6 @@ export default class ChronosPlugin extends Plugin {
 		let lastEventTime = 0;
 		const THROTTLE_MS = 500;
 
-		console.log("postprocessor fenced code chronos");
-
 		const container = el.createEl("div", {
 			cls: "chronos-timeline-container",
 		});
@@ -423,8 +467,6 @@ export default class ChronosPlugin extends Plugin {
 
 				// Stop event immediately
 				if (event.event instanceof MouseEvent) {
-					// logEventDetails(event.event, "Timeline MouseDown");
-
 					event.event.stopImmediatePropagation();
 					event.event.preventDefault();
 
@@ -434,7 +476,6 @@ export default class ChronosPlugin extends Plugin {
 					const item = timeline.items?.find(
 						(i: any) => i.id === itemId,
 					);
-					console.log("item", item);
 					if (!item?.cLink) return;
 
 					// Check for middle click or CMD+click (Mac)
@@ -590,48 +631,213 @@ export default class ChronosPlugin extends Plugin {
 	}
 
 	private async _generateTimelineFromFolder(editor: Editor) {
-		new FolderListModal(
-			this.app,
-			this.app.vault.getAllFolders(),
-			(f: TFolder) => {
+		// Ensure cache is initialized
+		if (!this.cacheInitialized) {
+			const notice = new Notice(
+				"Scanning folders for chronos items...",
+				0,
+			);
+			await this._initializeFolderCache();
+			notice.hide();
+		}
+
+		try {
+			// Use cached results to filter folders
+			const allFolders = this.app.vault.getAllFolders();
+			const foldersWithChronos = allFolders.filter((folder) => {
+				const cached = this.folderChronosCache.get(folder.path);
+				return cached === true;
+			});
+
+			if (foldersWithChronos.length === 0) {
+				new Notice("No folders contain chronos items (yet!)");
+				return;
+			}
+
+			new FolderListModal(this.app, foldersWithChronos, (f: TFolder) => {
+				const folderName = f.name;
 				const children = f.children;
 				let extracted: Set<string> = new Set<string>();
 
 				const tasks: Promise<string[]>[] = children
-				.filter((file: TFile) => file instanceof TFile)
-				.map((file: TFile) =>
-				{
-					return this.app.vault.cachedRead(file as TFile)
-					.then((text) => {
-						new Notice(`Read ${file.name}`);
+					.filter((file: TFile) => file instanceof TFile)
+					.map((file: TFile) => {
+						return this.app.vault
+							.cachedRead(file as TFile)
+							.then((text) => {
+								const rex_match: string[] = [];
+								let current_match;
 
-						const rex_match = [];
-						let current_match;
-						while ((current_match = DETECTION_PATTERN_TEXT.exec(text)) !== null)
-						{
-							console.log(current_match);
-							rex_match.push(current_match[1] as string);
-						}
+								// Extract inline chronos blocks (check for indicators)
+								const inlineMatches = [];
+								while (
+									(current_match =
+										DETECTION_PATTERN_TEXT.exec(text)) !==
+									null
+								) {
+									const content = current_match[1] as string;
+									const trimmed = content.trim();
+									// Check if already has an indicator or add "-" (Event) by deafult
+									const hasIndicator = /^[-@*~]/.test(
+										trimmed,
+									);
+									inlineMatches.push(
+										hasIndicator ? trimmed : `- ${trimmed}`,
+									);
+								}
 
-						return rex_match.map(text => `- ${text}`);
-					})
-					.catch((error) => {
-						new Notice(`Error while processing ${file.name}`);
-						return [];
+								// Extract full chronos code blocks (check for indicators)
+								while (
+									(current_match =
+										DETECTION_PATTERN_CODEBLOCK.exec(
+											text,
+										)) !== null
+								) {
+									// Extract all non-blank, non-comment lines from the code block
+									const blockContent = current_match[1];
+									const lines = blockContent.split("\n");
+									lines.forEach((line) => {
+										const trimmed = line.trim();
+										// Include any line that isn't blank, doesn't start with #, and doesn't start with > (flags)
+										if (
+											trimmed &&
+											!trimmed.startsWith("#") &&
+											!trimmed.startsWith(">")
+										) {
+											// Check if line already has an indicator (-, @, *, etc)
+											const hasIndicator = /^[-@*~]/.test(
+												trimmed,
+											);
+											rex_match.push(
+												hasIndicator
+													? trimmed
+													: `- ${trimmed}`,
+											);
+										}
+									});
+								}
+
+								// Combine all matches (already have prefixes applied)
+								return [...inlineMatches, ...rex_match];
+							})
+							.catch((_error) => {
+								new Notice(
+									`Error while processing ${file.name}`,
+								);
+								return [];
+							});
 					});
-				});
 
-				Promise.allSettled(tasks)
-				.then((results) =>{
-					results.forEach((result) =>
-					{
-						if(result.status === "fulfilled")
-							result.value.forEach(item => extracted.add(item));
+				Promise.allSettled(tasks).then((results) => {
+					results.forEach((result) => {
+						if (result.status === "fulfilled")
+							result.value.forEach((item) => extracted.add(item));
 					});
-					this._insertSnippet(editor, (ChronosTimeline.templates.blank).replace(/^\s*$/m, [...extracted].join("\n")));
+					// likely will not hit this edge case because folders are scanned for chronos - but fallback
+					if (extracted.size === 0) {
+						new Notice(
+							`No chronos items found in folder ${folderName}`,
+						);
+						return;
+					}
+
+					// Add height flag if more than 26 items
+					const itemsArray = [...extracted];
+					const heightFlag =
+						itemsArray.length > 26 ? "> HEIGHT 300\n" : "";
+
+					this._insertSnippet(
+						editor,
+						ChronosTimeline.templates.blank.replace(
+							/^\s*$/m,
+							heightFlag + itemsArray.join("\n"),
+						),
+					);
 				});
+			}).open();
+		} catch (error) {
+			new Notice("Error scanning for chronos items");
+			console.error("Error in _generateTimelineFromFolder:", error);
+		}
+	}
+
+	private async _folderContainsChronos(folder: TFolder): Promise<boolean> {
+		const children = folder.children.filter(
+			(file) => file instanceof TFile,
+		) as TFile[];
+
+		for (const file of children) {
+			try {
+				const text = await this.app.vault.cachedRead(file);
+
+				// Check for inline chronos blocks
+				if (DETECTION_PATTERN_TEXT.test(text)) {
+					return true;
+				}
+
+				// Check for full chronos code blocks with non-empty content
+				const codeBlockMatches = text.matchAll(
+					DETECTION_PATTERN_CODEBLOCK,
+				);
+				for (const match of codeBlockMatches) {
+					const blockContent = match[1];
+					const lines = blockContent.split("\n");
+					// Check if there's at least one non-blank, non-comment, non-flag line
+					const hasContent = lines.some((line) => {
+						const trimmed = line.trim();
+						return (
+							trimmed &&
+							!trimmed.startsWith("#") &&
+							!trimmed.startsWith(">")
+						);
+					});
+					if (hasContent) {
+						return true;
+					}
+				}
+			} catch (error) {
+				// Skip files that can't be read
+				continue;
 			}
-		).open();
+		}
+
+		return false;
+	}
+
+	private async _initializeFolderCache(): Promise<void> {
+		if (this.cacheInitialized) return;
+
+		const allFolders = this.app.vault.getAllFolders();
+		for (const folder of allFolders) {
+			const hasChronos = await this._folderContainsChronos(folder);
+			this.folderChronosCache.set(folder.path, hasChronos);
+		}
+		this.cacheInitialized = true;
+	}
+
+	private _invalidateFolderCache(folder: TFolder | null): void {
+		if (!folder) return;
+		// Remove this folder and all parent folders from cache
+		let current: TFolder | null = folder;
+		while (current) {
+			this.folderChronosCache.delete(current.path);
+			current = current.parent;
+		}
+		// Re-scan invalidated folders in background
+		this._recheckFolder(folder);
+	}
+
+	private async _recheckFolder(folder: TFolder): Promise<void> {
+		const hasChronos = await this._folderContainsChronos(folder);
+		this.folderChronosCache.set(folder.path, hasChronos);
+
+		// Also recheck parent folders
+		let current = folder.parent;
+		while (current) {
+			const parentHasChronos = await this._folderContainsChronos(current);
+			this.folderChronosCache.set(current.path, parentHasChronos);
+			current = current.parent;
+		}
 	}
 
 	private async _generateTimelineWithAi(editor: Editor) {
@@ -718,11 +924,6 @@ export default class ChronosPlugin extends Plugin {
 		const files = this.app.vault.getMarkdownFiles();
 
 		const updatedFiles = [];
-		console.log(
-			`Checking files for 'chronos' blocks to see whether there is a need to update links to ${this._normalizePath(
-				newPath,
-			)}...`,
-		);
 		for (const file of files) {
 			const content = await this.app.vault.read(file);
 			const hasChronosBlock = /```(?:\s*)chronos/.test(content);
@@ -741,7 +942,6 @@ export default class ChronosPlugin extends Plugin {
 				}
 			}
 		}
-		console.log(`Done checking files with 'chronos' blocks.`);
 		if (updatedFiles.length) {
 			console.log(
 				`Updated links to ${this._normalizePath(newPath)} in ${
